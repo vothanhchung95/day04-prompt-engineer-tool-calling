@@ -1,74 +1,90 @@
-import os
-import re
-from typing import List, Dict, Any, Optional
-from src.core.llm_provider import LLMProvider
-from src.telemetry.logger import logger
+import sys
+from pathlib import Path
+from typing import Annotated
+from typing_extensions import TypedDict
+from langgraph.graph import StateGraph, START, END
+from langgraph.graph.message import add_messages
+from langgraph.prebuilt import ToolNode, tools_condition
+from langchain_openai import ChatOpenAI
+from langchain_core.messages import SystemMessage, HumanMessage
+from dotenv import load_dotenv
 
-class ReActAgent:
-    """
-    SKELETON: A ReAct-style Agent that follows the Thought-Action-Observation loop.
-    Students should implement the core loop logic and tool execution.
-    """
-    
-    def __init__(self, llm: LLMProvider, tools: List[Dict[str, Any]], max_steps: int = 5):
-        self.llm = llm
-        self.tools = tools
-        self.max_steps = max_steps
-        self.history = []
+# Ensure project root is on sys.path so imports work regardless of how this is run
+ROOT_DIR = Path(__file__).parents[2]
+if str(ROOT_DIR) not in sys.path:
+    sys.path.insert(0, str(ROOT_DIR))
 
-    def get_system_prompt(self) -> str:
-        """
-        TODO: Implement the system prompt that instructs the agent to follow ReAct.
-        Should include:
-        1.  Available tools and their descriptions.
-        2.  Format instructions: Thought, Action, Observation.
-        """
-        tool_descriptions = "\n".join([f"- {t['name']}: {t['description']}" for t in self.tools])
-        return f"""
-        You are an intelligent assistant. You have access to the following tools:
-        {tool_descriptions}
+from src.agent.tools import search_flights, search_hotels, calculate_budget
 
-        Use the following format:
-        Thought: your line of reasoning.
-        Action: tool_name(arguments)
-        Observation: result of the tool call.
-        ... (repeat Thought/Action/Observation if needed)
-        Final Answer: your final response.
-        """
+load_dotenv(ROOT_DIR / ".env")
 
-    def run(self, user_input: str) -> str:
-        """
-        TODO: Implement the ReAct loop logic.
-        1. Generate Thought + Action.
-        2. Parse Action and execute Tool.
-        3. Append Observation to prompt and repeat until Final Answer.
-        """
-        logger.log_event("AGENT_START", {"input": user_input, "model": self.llm.model_name})
-        
-        current_prompt = user_input
-        steps = 0
+# 1. Đọc System Prompt
+with open(ROOT_DIR / "system_prompt.txt", "r", encoding="utf-8") as f:
+    SYSTEM_PROMPT = f.read()
 
-        while steps < self.max_steps:
-            # TODO: Generate LLM response
-            # result = self.llm.generate(current_prompt, system_prompt=self.get_system_prompt())
-            
-            # TODO: Parse Thought/Action from result
-            
-            # TODO: If Action found -> Call tool -> Append Observation
-            
-            # TODO: If Final Answer found -> Break loop
-            
-            steps += 1
-            
-        logger.log_event("AGENT_END", {"steps": steps})
-        return "Not implemented. Fill in the TODOs!"
+# 2. Khai báo State
+class AgentState(TypedDict):
+    messages: Annotated[list, add_messages]
 
-    def _execute_tool(self, tool_name: str, args: str) -> str:
-        """
-        Helper method to execute tools by name.
-        """
-        for tool in self.tools:
-            if tool['name'] == tool_name:
-                # TODO: Implement dynamic function calling or simple if/else
-                return f"Result of {tool_name}"
-        return f"Tool {tool_name} not found."
+# 3. Khởi tạo LLM và Tools
+tools_list = [search_flights, search_hotels, calculate_budget]
+llm = ChatOpenAI(model="gpt-4o-mini")
+llm_with_tools = llm.bind_tools(tools_list)
+
+# 4. Agent Node
+def agent_node(state: AgentState) -> AgentState:
+    messages = state["messages"]
+    if not isinstance(messages[0], SystemMessage):
+        messages = [SystemMessage(content=SYSTEM_PROMPT)] + messages
+
+    response = llm_with_tools.invoke(messages)
+
+    # === LOGGING ===
+    if response.tool_calls:
+        for tc in response.tool_calls:
+            print(f"  → Gọi tool: {tc['name']}({tc['args']})")
+    else:
+        print("  → Trả lời trực tiếp (không gọi tool)")
+
+    return {"messages": [response]}
+
+# 5. Xây dựng Graph
+builder = StateGraph(AgentState)
+builder.add_node("agent", agent_node)
+
+tool_node = ToolNode(tools_list)
+builder.add_node("tools", tool_node)
+
+builder.add_edge(START, "agent")
+builder.add_conditional_edges("agent", tools_condition)
+builder.add_edge("tools", "agent")
+
+graph = builder.compile()
+
+# 6. Chat loop
+if __name__ == "__main__":
+    print("=" * 60)
+    print("  TravelBuddy – Trợ lý Du lịch Thông minh")
+    print("  Gõ 'quit' hoặc 'q' để thoát")
+    print("=" * 60)
+
+    conversation_history: list = []
+
+    while True:
+        user_input = input("\nBạn: ").strip()
+        if not user_input:
+            continue
+        if user_input.lower() in ("quit", "exit", "q"):
+            print("Tạm biệt! Chúc bạn có chuyến đi vui vẻ 🌏")
+            break
+
+        # Append new user message and pass full history so context is preserved
+        conversation_history.append(HumanMessage(content=user_input))
+
+        print("\nTravelBuddy đang suy nghĩ...")
+        result = graph.invoke({"messages": conversation_history})
+
+        # Save full updated history (includes tool calls, observations, AI reply)
+        conversation_history = result["messages"]
+        final = conversation_history[-1]
+        print(f"\nTravelBuddy: {final.content}")
