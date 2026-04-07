@@ -1,5 +1,7 @@
 import sys
+import json
 from pathlib import Path
+from datetime import datetime
 from typing import Annotated
 from typing_extensions import TypedDict
 from langgraph.graph import StateGraph, START, END
@@ -22,6 +24,33 @@ load_dotenv(ROOT_DIR / ".env")
 with open(ROOT_DIR / "system_prompt.txt", "r", encoding="utf-8") as f:
     SYSTEM_PROMPT = f.read()
 
+
+# ============================================================
+# Conversation Logger – writes one JSON line per event to
+# logs/conversation_YYYYMMDD_HHMMSS.jsonl (file-only, no console spam)
+# ============================================================
+
+class ConversationLogger:
+    def __init__(self, log_dir: Path):
+        log_dir.mkdir(exist_ok=True)
+        self.session_id = datetime.now().strftime("%Y%m%d_%H%M%S")
+        self.log_file = log_dir / f"conversation_{self.session_id}.jsonl"
+
+    def log(self, event: str, data: dict) -> None:
+        entry = {
+            "timestamp": datetime.utcnow().isoformat(),
+            "session": self.session_id,
+            "event": event,
+            "data": data,
+        }
+        with open(self.log_file, "a", encoding="utf-8") as f:
+            f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+
+
+# Module-level logger reference — set by run_chat() before the graph runs
+_conv_logger: ConversationLogger | None = None
+
+
 # 2. Khai báo State
 class AgentState(TypedDict):
     messages: Annotated[list, add_messages]
@@ -43,8 +72,12 @@ def agent_node(state: AgentState) -> AgentState:
     if response.tool_calls:
         for tc in response.tool_calls:
             print(f"  → Gọi tool: {tc['name']}({tc['args']})")
+            if _conv_logger:
+                _conv_logger.log("TOOL_CALL", {"tool": tc["name"], "args": tc["args"]})
     else:
         print("  → Trả lời trực tiếp (không gọi tool)")
+        if _conv_logger:
+            _conv_logger.log("AI_RESPONSE", {"content": response.content})
 
     return {"messages": [response]}
 
@@ -61,22 +94,35 @@ builder.add_edge("tools", "agent")
 
 graph = builder.compile()
 
-# 6. Chat loop
-if __name__ == "__main__":
+
+# 6. Chat loop (callable from main.py or run directly)
+def run_chat() -> None:
+    global _conv_logger
+
+    log_dir = ROOT_DIR / "logs"
+    _conv_logger = ConversationLogger(log_dir)
+    _conv_logger.log("SESSION_START", {"model": "gpt-4o-mini"})
+    print(f"[Log] Saving conversation to {_conv_logger.log_file.name}")
+
     print("=" * 60)
     print("  TravelBuddy – Trợ lý Du lịch Thông minh")
     print("  Gõ 'quit' hoặc 'q' để thoát")
     print("=" * 60)
 
     conversation_history: list = []
+    turn = 0
 
     while True:
         user_input = input("\nBạn: ").strip()
         if not user_input:
             continue
         if user_input.lower() in ("quit", "exit", "q"):
+            _conv_logger.log("SESSION_END", {"turns": turn})
             print("Tạm biệt! Chúc bạn có chuyến đi vui vẻ 🌏")
             break
+
+        turn += 1
+        _conv_logger.log("USER_MESSAGE", {"turn": turn, "content": user_input})
 
         # Append new user message and pass full history so context is preserved
         conversation_history.append(HumanMessage(content=user_input))
@@ -88,3 +134,7 @@ if __name__ == "__main__":
         conversation_history = result["messages"]
         final = conversation_history[-1]
         print(f"\nTravelBuddy: {final.content}")
+
+
+if __name__ == "__main__":
+    run_chat()
